@@ -61,6 +61,8 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     load_model_path = os.environ.get("LOAD_MODEL_PATH", "").strip()
+    fake_quant_after_frac = float(os.environ.get("FAKE_QUANT_AFTER_FRAC", 0.0))
+    fake_quant_every = int(os.environ.get("FAKE_QUANT_EVERY", 1))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -440,6 +442,22 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
+
+def dequantize_tensor_int8(q: Tensor, s: Tensor, dtype: torch.dtype) -> Tensor:
+    if s.ndim > 0:
+        scale = s.to(dtype=torch.float32)
+        return (q.float() * scale.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+    return (q.float() * float(s.item())).to(dtype=dtype).contiguous()
+
+@torch.no_grad()
+def apply_fake_quant_to_model_(model: nn.Module) -> None:
+    for name, param in model.named_parameters():
+        if not param.is_floating_point():
+            continue
+        if param.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            continue
+        q, s = quantize_float_tensor(param)
+        param.copy_(dequantize_tensor_int8(q, s, param.dtype))
 
 
 # -----------------------------
@@ -945,6 +963,7 @@ def main() -> None:
         f"export_codec:{EXPORT_CODEC} export_codec_level:{EXPORT_CODEC_LEVEL} "
         f"int8_clip_percentile:{INT8_CLIP_PERCENTILE} keep_float_max_numel:{INT8_KEEP_FLOAT_MAX_NUMEL}"
     )
+    log0(f"fake_quant_after_frac:{args.fake_quant_after_frac} fake_quant_every:{args.fake_quant_every}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1080,6 +1099,14 @@ def main() -> None:
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
+        if args.fake_quant_after_frac > 0 and args.fake_quant_every > 0:
+            fake_quant_ready = (
+                approx_training_time_ms >= args.fake_quant_after_frac * max_wallclock_ms
+                if max_wallclock_ms is not None
+                else step / max(args.iterations, 1) >= args.fake_quant_after_frac
+            )
+            if fake_quant_ready and step % args.fake_quant_every == 0:
+                apply_fake_quant_to_model_(base_model)
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
