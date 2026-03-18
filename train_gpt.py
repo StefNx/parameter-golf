@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import lzma
 import math
 import os
 import random
@@ -303,14 +304,30 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", 65_536))
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
+INT8_CLIP_PERCENTILE = float(os.environ.get("INT8_CLIP_PERCENTILE", 99.99984))
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+EXPORT_CODEC = os.environ.get("EXPORT_CODEC", "zlib").lower()
+EXPORT_CODEC_LEVEL = int(os.environ.get("EXPORT_CODEC_LEVEL", 9 if EXPORT_CODEC == "zlib" else 6))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
+
+def compress_bytes(blob: bytes) -> bytes:
+    if EXPORT_CODEC == "zlib":
+        return zlib.compress(blob, level=EXPORT_CODEC_LEVEL)
+    if EXPORT_CODEC == "lzma":
+        return lzma.compress(blob, preset=EXPORT_CODEC_LEVEL)
+    raise ValueError(f"Unsupported EXPORT_CODEC={EXPORT_CODEC!r}")
+
+def decompress_bytes(blob: bytes) -> bytes:
+    if EXPORT_CODEC == "zlib":
+        return zlib.decompress(blob)
+    if EXPORT_CODEC == "lzma":
+        return lzma.decompress(blob)
+    raise ValueError(f"Unsupported EXPORT_CODEC={EXPORT_CODEC!r}")
 
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
@@ -919,6 +936,10 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"unique_layers:{base_model.num_unique_layers}")
+    log0(
+        f"export_codec:{EXPORT_CODEC} export_codec_level:{EXPORT_CODEC_LEVEL} "
+        f"int8_clip_percentile:{INT8_CLIP_PERCENTILE} keep_float_max_numel:{INT8_KEEP_FLOAT_MAX_NUMEL}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1092,7 +1113,7 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = compress_bytes(quant_raw)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1101,16 +1122,16 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int8+{EXPORT_CODEC}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+{EXPORT_CODEC}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(decompress_bytes(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1128,10 +1149,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int8_{EXPORT_CODEC}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int8_{EXPORT_CODEC}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     if not math.isnan(last_val_bpb):
         log0(
             f"quant_gap pre_quant_val_loss:{last_val_loss:.4f} pre_quant_val_bpb:{last_val_bpb:.4f} "
