@@ -60,6 +60,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", train_seq_len))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    load_model_path = os.environ.get("LOAD_MODEL_PATH", "").strip()
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -867,6 +868,8 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if args.load_model_path:
+        base_model.load_state_dict(torch.load(args.load_model_path, map_location="cpu"), strict=True)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -936,6 +939,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"unique_layers:{base_model.num_unique_layers}")
+    if args.load_model_path:
+        log0(f"load_model_path:{args.load_model_path}")
     log0(
         f"export_codec:{EXPORT_CODEC} export_codec_level:{EXPORT_CODEC_LEVEL} "
         f"int8_clip_percentile:{INT8_CLIP_PERCENTILE} keep_float_max_numel:{INT8_KEEP_FLOAT_MAX_NUMEL}"
