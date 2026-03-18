@@ -4,6 +4,7 @@ import os
 import shutil
 from pathlib import Path
 
+import numpy as np
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import RemoteEntryNotFoundError
 
@@ -13,6 +14,11 @@ REMOTE_ROOT_PREFIX = os.environ.get("MATCHED_FINEWEB_REMOTE_ROOT_PREFIX", "datas
 ROOT = Path(__file__).resolve().parent
 DATASETS_DIR = ROOT / "datasets"
 TOKENIZERS_DIR = ROOT / "tokenizers"
+SHARD_HEADER_INTS = 256
+SHARD_MAGIC = 20240520
+SHARD_VERSION = 1
+SHARD_HEADER_BYTES = SHARD_HEADER_INTS * np.dtype("<i4").itemsize
+SHARD_TOKEN_BYTES = np.dtype("<u2").itemsize
 
 def dataset_dir_for_variant(name: str) -> str:
     if name == "byte260":
@@ -35,8 +41,10 @@ def local_path_for_remote(relative_path: str) -> Path:
 
 def get(relative_path: str) -> None:
     destination = local_path_for_remote(relative_path)
-    if destination.exists():
+    if destination.exists() and not needs_redownload(destination):
         return
+    if destination.exists():
+        destination.unlink()
     if destination.is_symlink():
         destination.unlink()
 
@@ -70,6 +78,22 @@ def get(relative_path: str) -> None:
         os.link(cached_source, destination)
     except OSError:
         shutil.copy2(cached_source, destination)
+
+
+def expected_shard_size(path: Path) -> int | None:
+    if path.suffix != ".bin" or "fineweb_" not in path.name:
+        return None
+    header = np.fromfile(path, dtype="<i4", count=SHARD_HEADER_INTS)
+    if header.size != SHARD_HEADER_INTS or int(header[0]) != SHARD_MAGIC or int(header[1]) != SHARD_VERSION:
+        return None
+    return SHARD_HEADER_BYTES + int(header[2]) * SHARD_TOKEN_BYTES
+
+
+def needs_redownload(path: Path) -> bool:
+    expected_size = expected_shard_size(path)
+    if expected_size is None:
+        return False
+    return path.stat().st_size != expected_size
 
 
 def manifest_path() -> Path:
