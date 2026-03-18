@@ -62,6 +62,7 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    unique_layers = int(os.environ.get("UNIQUE_LAYERS", 0))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -653,6 +654,7 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
+        unique_layers: int,
         mlp_mult: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
@@ -666,11 +668,17 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_unique_layers = unique_layers if unique_layers > 0 else num_layers
+        if self.num_unique_layers > num_layers:
+            raise ValueError(f"unique_layers must be <= num_layers, got {self.num_unique_layers} > {num_layers}")
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.layer_block_ids = [i % self.num_unique_layers for i in range(num_layers)]
+        self.encoder_block_ids = self.layer_block_ids[: self.num_encoder_layers]
+        self.decoder_block_ids = self.layer_block_ids[self.num_encoder_layers :]
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -681,7 +689,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for _ in range(self.num_unique_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -705,12 +713,12 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[self.encoder_block_ids[i]](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.decoder_block_ids[i]](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -829,6 +837,7 @@ def main() -> None:
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
+        unique_layers=args.unique_layers,
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
@@ -907,6 +916,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"unique_layers:{base_model.num_unique_layers}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -966,6 +976,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    last_val_loss = float("nan")
+    last_val_bpb = float("nan")
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -989,6 +1001,7 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            last_val_loss, last_val_bpb = val_loss, val_bpb
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1117,6 +1130,11 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if not math.isnan(last_val_bpb):
+        log0(
+            f"quant_gap pre_quant_val_loss:{last_val_loss:.4f} pre_quant_val_bpb:{last_val_bpb:.4f} "
+            f"delta_val_loss:{q_val_loss - last_val_loss:.4f} delta_val_bpb:{q_val_bpb - last_val_bpb:.4f}"
+        )
 
     if distributed:
         dist.destroy_process_group()

@@ -66,6 +66,7 @@ class Hyperparameters:
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
+    unique_layers: int = int(os.environ.get("UNIQUE_LAYERS", 0))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -380,7 +381,7 @@ class GPT(nn.Module):
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, unique_layers: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float):
         super().__init__()
@@ -388,15 +389,21 @@ class GPT(nn.Module):
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.num_unique_layers = unique_layers if unique_layers > 0 else num_layers
+        if self.num_unique_layers > num_layers:
+            raise ValueError(f"unique_layers must be <= num_layers, got {self.num_unique_layers} > {num_layers}")
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        self.layer_block_ids = [i % self.num_unique_layers for i in range(num_layers)]
+        self.encoder_block_ids = self.layer_block_ids[: self.num_encoder_layers]
+        self.decoder_block_ids = self.layer_block_ids[self.num_encoder_layers :]
         self.blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
+            for _ in range(self.num_unique_layers)
         ]
         self.final_norm = RMSNormNoWeight()
 
@@ -417,7 +424,7 @@ class GPT(nn.Module):
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[self.encoder_block_ids[i]](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             # Odd layer counts have one more decoder block than encoder block. The baseline only
@@ -425,7 +432,7 @@ class GPT(nn.Module):
             # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.decoder_block_ids[i]](x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -879,6 +886,7 @@ def main() -> None:
         dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
+        unique_layers=args.unique_layers,
         mlp_mult=args.mlp_mult,
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
@@ -924,6 +932,7 @@ def main() -> None:
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
+    log(f"unique_layers:{model.num_unique_layers}")
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
@@ -986,6 +995,8 @@ def main() -> None:
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     stop_after_step: int | None = None
+    last_val_loss = float("nan")
+    last_val_bpb = float("nan")
     t0 = time.perf_counter()
     step = 0
     while True:
@@ -1000,6 +1011,7 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            last_val_loss, last_val_bpb = val_loss, val_bpb
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             if step % 25 == 0 or last_step:
                 log(
@@ -1082,6 +1094,11 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if not math.isnan(last_val_bpb):
+        log(
+            f"quant_gap pre_quant_val_loss:{last_val_loss:.4f} pre_quant_val_bpb:{last_val_bpb:.4f} "
+            f"delta_val_loss:{q_val_loss - last_val_loss:.4f} delta_val_bpb:{q_val_bpb - last_val_bpb:.4f}"
+        )
 
 
 if __name__ == "__main__":
