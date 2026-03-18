@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import RemoteEntryNotFoundError
 
 
 REPO_ID = os.environ.get("MATCHED_FINEWEB_REPO_ID", "willdepueoai/parameter-golf")
@@ -40,14 +41,27 @@ def get(relative_path: str) -> None:
         destination.unlink()
 
     remote_path = Path(relative_path)
-    cached_path = Path(
-        hf_hub_download(
-            repo_id=REPO_ID,
-            filename=remote_path.name,
-            subfolder=remote_path.parent.as_posix() if remote_path.parent != Path(".") else None,
-            repo_type="dataset",
-        )
+    download_kwargs = dict(
+        repo_id=REPO_ID,
+        filename=remote_path.name,
+        subfolder=remote_path.parent.as_posix() if remote_path.parent != Path(".") else None,
+        repo_type="dataset",
     )
+    try:
+        cached_path = Path(hf_hub_download(**download_kwargs))
+    except RemoteEntryNotFoundError:
+        if REMOTE_ROOT_PREFIX and remote_path.parts[:1] != (REMOTE_ROOT_PREFIX,):
+            prefixed_path = Path(REMOTE_ROOT_PREFIX) / remote_path
+            cached_path = Path(
+                hf_hub_download(
+                    repo_id=REPO_ID,
+                    filename=prefixed_path.name,
+                    subfolder=prefixed_path.parent.as_posix(),
+                    repo_type="dataset",
+                )
+            )
+        else:
+            raise
     # HF cache entries may be snapshot symlinks. Resolve to the underlying blob so we
     # always materialize a real file in data/, not a broken relative symlink.
     cached_source = cached_path.resolve(strict=True)
