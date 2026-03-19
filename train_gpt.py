@@ -1135,6 +1135,7 @@ def main() -> None:
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(base_model.state_dict(), Path("logs") / f"{args.run_id}.final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
@@ -1149,6 +1150,8 @@ def main() -> None:
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
+            f.write(quant_blob)
+        with open(Path("logs") / f"{args.run_id}.final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
